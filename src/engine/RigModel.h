@@ -1,0 +1,879 @@
+// RigModel.h — the model: a Rig (the whole signal chain), the Songs and
+// Setlists that order them, the JSON they persist as, and the PATH SPACE that
+// every one of them is edited through.
+//
+// THE PATH SPACE is the single idea this file exists for. One string names any
+// settable value in the rig:
+//
+//     in.trim            amp.gain          cab.model        out.master
+//     pre.2.drive        pre.2.bypass      pre.2.type       post.0.mix
+//     synth.cutoff       loop.level
+//
+// The UI writes paths. MIDI learn stores paths. Footswitches toggle paths.
+// Presets are maps of path to value. Automation resolves to paths. There is
+// exactly one setter, so a control added to the UI is automatable, learnable and
+// saveable the moment it exists, with no extra plumbing and no second list to
+// keep in sync.
+#pragma once
+#include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_core/juce_core.h>
+#include "BlockParams.h"
+#include "PedalDsp.h"
+
+namespace topend {
+
+//==============================================================================
+/// `Documents/Amanorsac Studio/Top End`, or the TOPEND_DATA_DIR override that
+/// the tests and the CI soak run use so they never touch a real user's library.
+inline juce::File appDataDir()
+{
+    if (auto env = juce::SystemStats::getEnvironmentVariable ("TOPEND_DATA_DIR", {}); env.isNotEmpty())
+        return juce::File (env);
+    return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+             .getChildFile ("Amanorsac Studio").getChildFile ("Top End");
+}
+/// MACHINE STATE — caches, window positions, the web view's profile: things a
+/// player would not miss and would not want in Documents. The studio's File &
+/// Data Conventions fix this at %LOCALAPPDATA% on Windows (not Roaming, which is
+/// where JUCE's own helper points) and ~/Library/Application Support on macOS.
+inline juce::File machineStateDir()
+{
+    if (auto env = juce::SystemStats::getEnvironmentVariable ("TOPEND_STATE_DIR", {}); env.isNotEmpty())
+        return juce::File (env);
+   #if JUCE_WINDOWS
+    auto base = juce::File (juce::SystemStats::getEnvironmentVariable ("LOCALAPPDATA", {}));
+    if (! base.isDirectory())
+        base = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory);
+   #elif JUCE_MAC
+    auto base = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("Application Support");
+   #else
+    auto base = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory);
+   #endif
+    return base.getChildFile ("Amanorsac Studio").getChildFile ("Top End");
+}
+/// Moves something an earlier build kept in the wrong place. Only ever runs when
+/// the new location does not exist yet, so it cannot overwrite anything.
+inline void migrateOnce (const juce::File& from, const juce::File& to)
+{
+    if (from == to || ! from.exists() || to.exists()) return;
+    to.getParentDirectory().createDirectory();
+    if (! from.moveFileTo (to) && from.isDirectory() && from.copyDirectoryTo (to))
+        from.deleteRecursively();
+}
+/// FACTORY CONTENT the installer places and the product only reads: the stem
+/// separation model. One fixed location per platform, because the plug-in has to
+/// find it without knowing where (or whether) the standalone was installed.
+inline juce::File factoryDir()
+{
+    if (auto env = juce::SystemStats::getEnvironmentVariable ("TOPEND_FACTORY_DIR", {}); env.isNotEmpty())
+        return juce::File (env);
+   #if JUCE_WINDOWS
+    return juce::File::getSpecialLocation (juce::File::globalApplicationsDirectory)
+             .getChildFile ("Amanorsac Studio").getChildFile ("Top End");
+   #elif JUCE_MAC
+    return juce::File ("/Library/Application Support/Amanorsac Studio/Top End");
+   #else
+    return juce::File ("/usr/share/amanorsac-studio/low-end");
+   #endif
+}
+inline juce::File presetsDir()  { return appDataDir().getChildFile ("Presets"); }
+inline juce::File songsDir()    { return appDataDir().getChildFile ("Songs"); }
+inline juce::File setlistsDir() { return appDataDir().getChildFile ("Setlists"); }
+inline juce::File irDir()       { return appDataDir().getChildFile ("IRs"); }
+inline juce::File loopsDir()    { return appDataDir().getChildFile ("Loops"); }
+/// Presets the player exports, one file each, to keep or to give to someone.
+inline juce::File exportsDir()  { return appDataDir().getChildFile ("Exports"); }
+/// Presets a beta tester has chosen to send back to the studio (see sharePresets).
+inline juce::File betaPresetsDir() { return appDataDir().getChildFile ("Beta Presets"); }
+inline juce::File stageDir()    { return appDataDir().getChildFile ("Stage"); }
+
+//==============================================================================
+struct Rig
+{
+    juce::String id;                 ///< uuid; empty for an unsaved rig
+    juce::String name { "New Rig" };
+    juce::String notes;
+    juce::uint32 colour = 0xff2E7DF7;
+    /// Sort key for the preset list. Presets are files named by uuid, so without
+    /// this the library would come back in whatever order the filesystem hands
+    /// them over — which made the factory content appear shuffled. The factory
+    /// writes its declaration order here; a preset the user saves gets the
+    /// default and sorts after them, by name.
+    int order = 1000;
+
+    ParamValues in { defaultsFor (inputParams()) };
+    ParamValues amp { defaultsFor (ampParams()) };
+    ParamValues cab { defaultsFor (cabParams()) };
+    ParamValues out { defaultsFor (outputParams()) };
+    ParamValues synth { defaultsFor (synthParams()) };
+    ParamValues loop { defaultsFor (looperParams()) };
+
+    ChainState pre;                  ///< pedalboard, in front of the amp
+    ChainState post;                 ///< after the cab
+
+    /// What changed at each save, newest first, so a player can see how a
+    /// sound got where it is ("Drive 38 -> 32, cab to 4x12"). Capped; see
+    /// `kRigHistory`.
+    struct Change { juce::int64 time = 0; juce::String text; };
+    std::vector<Change> history;
+};
+constexpr int kRigHistory = 12;
+
+struct Song
+{
+    juce::String id, name { "New Song" }, notes;
+    double tempo = 120.0;
+    juce::uint32 colour = 0xff2E7DF7;
+    juce::StringArray presetIds;     ///< the scenes, in order
+    /// "Saved to this set only": a scene's own version of its preset. The
+    /// preset in the library is untouched; only this set plays the override.
+    std::map<int, Rig> overrides;
+};
+
+struct Setlist
+{
+    juce::String id, name { "New Set" };
+    juce::StringArray songIds;
+};
+
+/// One learned control: a MIDI CC (or a key) driving a path over a range.
+struct Binding
+{
+    int cc = -1;                     ///< MIDI CC number, or -1
+    int keyCode = 0;                 ///< computer-key code for the stage view, or 0
+    juce::String path;               ///< what it moves
+    float lo = 0.0f, hi = 1.0f;      ///< range, in the path's own units
+    bool toggle = false;             ///< momentary switch rather than a continuous value
+};
+
+/// A footswitch role that is not a plain path (transport, tuner, panic...).
+enum class SwitchRole : int
+{
+    none = 0, presetNext, presetPrev, tapTempo, tuner,
+    loopRecord, loopStop, loopUndo, loopClear, panic,
+    // One switch per scene of the set (A-F), the way a floor unit is laid out.
+    sceneA, sceneB, sceneC, sceneD, sceneE, sceneF, bypassAll, Count
+};
+inline const char* switchRoleId (SwitchRole r)
+{
+    static const char* ids[] = { "none", "presetNext", "presetPrev", "tapTempo", "tuner",
+                                 "loopRecord", "loopStop", "loopUndo", "loopClear", "panic",
+                                 "sceneA", "sceneB", "sceneC", "sceneD", "sceneE", "sceneF", "bypassAll" };
+    const int i = (int) r;
+    return (i >= 0 && i < (int) SwitchRole::Count) ? ids[i] : ids[0];
+}
+inline SwitchRole switchRoleFromId (const juce::String& s)
+{
+    for (int i = 0; i < (int) SwitchRole::Count; ++i)
+        if (s == switchRoleId ((SwitchRole) i)) return (SwitchRole) i;
+    return SwitchRole::none;
+}
+struct SwitchBinding { int cc = -1; SwitchRole role = SwitchRole::none; };
+
+//==============================================================================
+// PATH SPACE
+//==============================================================================
+struct PathInfo
+{
+    bool valid = false;
+    ParamKind kind = ParamKind::Float;
+    float min = 0, max = 1, def = 0;
+    juce::String label, unit;
+    std::vector<const char*> choices;
+};
+
+namespace detail {
+    /// Splits "pre.2.drive" into { "pre", 2, "drive" }; index is -1 when absent.
+    inline bool splitPath (const juce::String& path, juce::String& section, int& index, juce::String& param)
+    {
+        auto parts = juce::StringArray::fromTokens (path, ".", "");
+        if (parts.size() == 2) { section = parts[0]; index = -1; param = parts[1]; return true; }
+        if (parts.size() == 3) { section = parts[0]; index = parts[1].getIntValue(); param = parts[2]; return true; }
+        return false;
+    }
+    inline ChainState* chainFor (Rig& r, const juce::String& section)
+    {
+        if (section == "pre") return &r.pre;
+        if (section == "post") return &r.post;
+        return nullptr;
+    }
+    inline const ChainState* chainFor (const Rig& r, const juce::String& section)
+    {
+        if (section == "pre") return &r.pre;
+        if (section == "post") return &r.post;
+        return nullptr;
+    }
+    inline ParamValues* valuesFor (Rig& r, const juce::String& section)
+    {
+        if (section == "in") return &r.in;
+        if (section == "amp") return &r.amp;
+        if (section == "cab") return &r.cab;
+        if (section == "out") return &r.out;
+        if (section == "synth") return &r.synth;
+        if (section == "loop") return &r.loop;
+        return nullptr;
+    }
+    inline const ParamValues* valuesFor (const Rig& r, const juce::String& section)
+    {
+        return valuesFor (const_cast<Rig&> (r), section);
+    }
+}
+
+/// What a path is: range, kind, label. Used by the UI and by MIDI learn to scale
+/// a 0..127 CC into the path's own units.
+inline PathInfo pathInfo (const Rig& rig, const juce::String& path)
+{
+    PathInfo info;
+    juce::String section, param; int index = -1;
+    if (! detail::splitPath (path, section, index, param)) return info;
+
+    if (auto* chain = detail::chainFor (rig, section))
+    {
+        if (index < 0 || index >= (int) chain->size()) return info;
+        const auto& slot = (*chain)[(size_t) index];
+        if (param == "bypass") { info = { true, ParamKind::Bool, 0, 1, 0, "Bypass", "", {} }; return info; }
+        if (param == "type")   { info = { true, ParamKind::Enum, 0, (float) (kNumBlockTypes - 1), 0, "Type", "", {} }; return info; }
+        if (auto* p = findBlockParam (blockSpec (slot.type), param.toStdString()))
+        {
+            info = { true, p->kind, p->min, p->max, p->def, p->label, p->unit, p->choices };
+            return info;
+        }
+        return info;
+    }
+    if (auto* list = sectionParams (section.toStdString()))
+        if (auto* p = findParamIn (*list, param.toStdString()))
+            info = { true, p->kind, p->min, p->max, p->def, p->label, p->unit, p->choices };
+    return info;
+}
+
+/// The one setter. Returns false for a path that does not resolve — callers log
+/// that rather than guessing, so a preset written against an older block layout
+/// never silently lands on the wrong control.
+inline bool setPath (Rig& rig, const juce::String& path, float value)
+{
+    juce::String section, param; int index = -1;
+    if (! detail::splitPath (path, section, index, param)) return false;
+
+    if (auto* chain = detail::chainFor (rig, section))
+    {
+        if (index < 0 || index >= (int) chain->size()) return false;
+        auto& slot = (*chain)[(size_t) index];
+        if (param == "bypass") { slot.bypassed = value >= 0.5f; return true; }
+        if (param == "type")
+        {
+            const auto t = (BlockType) juce::jlimit (0, kNumBlockTypes - 1, (int) std::round (value));
+            if (t != slot.type) { slot.type = t; slot.params = defaultBlockParams (t); slot.bypassed = false; }
+            return true;
+        }
+        auto* p = findBlockParam (blockSpec (slot.type), param.toStdString());
+        if (! p) return false;
+        slot.params[param.toStdString()] = juce::jlimit (p->min, p->max, value);
+        return true;
+    }
+
+    auto* values = detail::valuesFor (rig, section);
+    auto* list = sectionParams (section.toStdString());
+    if (! values || ! list) return false;
+    auto* p = findParamIn (*list, param.toStdString());
+    if (! p) return false;
+    (*values)[param.toStdString()] = juce::jlimit (p->min, p->max, value);
+    return true;
+}
+
+inline float getPath (const Rig& rig, const juce::String& path, bool* ok = nullptr)
+{
+    if (ok) *ok = false;
+    juce::String section, param; int index = -1;
+    if (! detail::splitPath (path, section, index, param)) return 0.0f;
+
+    if (auto* chain = detail::chainFor (rig, section))
+    {
+        if (index < 0 || index >= (int) chain->size()) return 0.0f;
+        const auto& slot = (*chain)[(size_t) index];
+        if (param == "bypass") { if (ok) *ok = true; return slot.bypassed ? 1.0f : 0.0f; }
+        if (param == "type")   { if (ok) *ok = true; return (float) (int) slot.type; }
+        auto it = slot.params.find (param.toStdString());
+        if (it == slot.params.end()) return 0.0f;
+        if (ok) *ok = true;
+        return it->second;
+    }
+    auto* values = detail::valuesFor (rig, section);
+    if (! values) return 0.0f;
+    auto it = values->find (param.toStdString());
+    if (it == values->end()) return 0.0f;
+    if (ok) *ok = true;
+    return it->second;
+}
+
+/// Every path a rig currently exposes, in UI order. Used by MIDI learn's list
+/// and by the "what changed" diff when a preset is saved.
+inline juce::StringArray allPaths (const Rig& rig)
+{
+    juce::StringArray out;
+    auto addSection = [&out] (const char* name, const std::vector<ParamSpec>& list)
+    {
+        for (auto& p : list) out.add (juce::String (name) + "." + p.id);
+    };
+    addSection ("in", inputParams());
+    for (size_t i = 0; i < rig.pre.size(); ++i)
+    {
+        const juce::String base = "pre." + juce::String ((int) i) + ".";
+        out.add (base + "bypass");
+        for (auto& p : blockSpec (rig.pre[i].type).params) out.add (base + p.id);
+    }
+    addSection ("amp", ampParams());
+    addSection ("cab", cabParams());
+    for (size_t i = 0; i < rig.post.size(); ++i)
+    {
+        const juce::String base = "post." + juce::String ((int) i) + ".";
+        out.add (base + "bypass");
+        for (auto& p : blockSpec (rig.post[i].type).params) out.add (base + p.id);
+    }
+    addSection ("synth", synthParams());
+    addSection ("loop", looperParams());
+    addSection ("out", outputParams());
+    return out;
+}
+
+//==============================================================================
+// JSON
+//==============================================================================
+namespace detail {
+    inline juce::var obj() { return juce::var (new juce::DynamicObject()); }
+    inline void set (juce::var& o, const char* k, const juce::var& v) { o.getDynamicObject()->setProperty (k, v); }
+
+    inline juce::var valuesToVar (const ParamValues& v)
+    {
+        auto o = obj();
+        for (auto& [k, val] : v) set (o, k.c_str(), val);
+        return o;
+    }
+    inline void valuesFromVar (const juce::var& v, ParamValues& out)
+    {
+        if (auto* d = v.getDynamicObject())
+            for (auto& prop : d->getProperties())
+            {
+                const auto key = prop.name.toString().toStdString();
+                if (out.find (key) != out.end()) out[key] = (float) (double) prop.value;
+            }
+    }
+    inline juce::var chainToVar (const ChainState& c)
+    {
+        juce::Array<juce::var> arr;
+        for (auto& b : c)
+        {
+            auto o = obj();
+            set (o, "type", juce::String (blockSpec (b.type).id));
+            set (o, "bypassed", b.bypassed);
+            set (o, "params", valuesToVar (b.params));
+            arr.add (o);
+        }
+        return arr;
+    }
+    inline ChainState chainFromVar (const juce::var& v, juce::StringArray* unresolved = nullptr)
+    {
+        ChainState out;
+        if (auto* arr = v.getArray())
+            for (auto& e : *arr)
+            {
+                const auto id = e.getProperty ("type", "none").toString();
+                const auto t = blockTypeFromId (id.toStdString());
+                if (! t.has_value())
+                {
+                    if (unresolved) unresolved->add (id);
+                    continue;
+                }
+                BlockState b = defaultBlockState (*t, (bool) e.getProperty ("bypassed", false));
+                valuesFromVar (e.getProperty ("params", {}), b.params);
+                out.push_back (std::move (b));
+            }
+        return out;
+    }
+}
+
+inline juce::var rigToVar (const Rig& r)
+{
+    using detail::set;
+    auto o = detail::obj();
+    set (o, "schema", 1);
+    set (o, "id", r.id);
+    set (o, "name", r.name);
+    set (o, "notes", r.notes);
+    set (o, "colour", (int) r.colour);
+    set (o, "order", r.order);
+    set (o, "in", detail::valuesToVar (r.in));
+    set (o, "amp", detail::valuesToVar (r.amp));
+    set (o, "cab", detail::valuesToVar (r.cab));
+    set (o, "out", detail::valuesToVar (r.out));
+    set (o, "synth", detail::valuesToVar (r.synth));
+    set (o, "loop", detail::valuesToVar (r.loop));
+    set (o, "pre", detail::chainToVar (r.pre));
+    set (o, "post", detail::chainToVar (r.post));
+    juce::Array<juce::var> h;
+    for (auto& c : r.history)
+    {
+        auto e = detail::obj();
+        set (e, "t", (double) c.time);
+        set (e, "x", c.text);
+        h.add (e);
+    }
+    set (o, "history", h);
+    return o;
+}
+
+inline Rig rigFromVar (const juce::var& v, juce::StringArray* unresolved = nullptr)
+{
+    Rig r;
+    if (! v.isObject()) return r;
+    r.id = v.getProperty ("id", {}).toString();
+    r.name = v.getProperty ("name", "New Rig").toString();
+    r.notes = v.getProperty ("notes", {}).toString();
+    r.colour = (juce::uint32) (int) v.getProperty ("colour", (int) 0xff2E7DF7);
+    r.order = (int) v.getProperty ("order", 1000);
+    detail::valuesFromVar (v.getProperty ("in", {}), r.in);
+    detail::valuesFromVar (v.getProperty ("amp", {}), r.amp);
+    detail::valuesFromVar (v.getProperty ("cab", {}), r.cab);
+    detail::valuesFromVar (v.getProperty ("out", {}), r.out);
+    detail::valuesFromVar (v.getProperty ("synth", {}), r.synth);
+    detail::valuesFromVar (v.getProperty ("loop", {}), r.loop);
+    r.pre = detail::chainFromVar (v.getProperty ("pre", {}), unresolved);
+    r.post = detail::chainFromVar (v.getProperty ("post", {}), unresolved);
+    if (auto* h = v.getProperty ("history", {}).getArray())
+        for (auto& e : *h)
+            if ((int) r.history.size() < kRigHistory)
+                r.history.push_back ({ (juce::int64) (double) e.getProperty ("t", 0.0), e.getProperty ("x", {}).toString() });
+    return r;
+}
+
+/// A one-line, human description of what differs between two versions of a
+/// rig: the first few changes, in the order a player would name them.
+inline juce::String describeRigChange (const Rig& before, const Rig& after)
+{
+    juce::StringArray bits;
+    auto num = [] (float v) { return std::abs (v - std::round (v)) < 0.05f ? juce::String ((int) std::round (v)) : juce::String (v, 1); };
+    auto section = [&] (const char* what, const std::vector<ParamSpec>& specs, const ParamValues& a, const ParamValues& b)
+    {
+        for (auto& p : specs)
+        {
+            const auto ia = a.find (p.id), ib = b.find (p.id);
+            if (ia == a.end() || ib == b.end() || std::abs (ia->second - ib->second) < 0.01f) continue;
+            if (p.kind == ParamKind::Enum && ! p.choices.empty())
+            {
+                const int k = juce::jlimit (0, (int) p.choices.size() - 1, (int) std::round (ib->second));
+                bits.add (juce::String (what) + (*what ? " " : "") + juce::String (p.label).toLowerCase() + " to " + p.choices[(size_t) k]);
+            }
+            else if (p.kind == ParamKind::Bool)
+                bits.add (juce::String (what) + (*what ? " " : "") + juce::String (p.label).toLowerCase() + (ib->second >= 0.5f ? " on" : " off"));
+            else
+                bits.add (juce::String (what) + (*what ? " " : "") + juce::String (p.label).toLowerCase() + " "
+                          + num (ia->second) + " → " + num (ib->second));
+        }
+    };
+    section ("Amp", ampParams(), before.amp, after.amp);
+    section ("Cab", cabParams(), before.cab, after.cab);
+    auto chain = [&] (const ChainState& a, const ChainState& b)
+    {
+        for (auto& x : b)
+        {
+            const bool had = std::any_of (a.begin(), a.end(), [&x] (const BlockState& y) { return y.type == x.type; });
+            if (! had) bits.add ("Added " + juce::String (blockSpec (x.type).name));
+        }
+        for (auto& y : a)
+        {
+            const bool has = std::any_of (b.begin(), b.end(), [&y] (const BlockState& x) { return x.type == y.type; });
+            if (! has) bits.add ("Removed " + juce::String (blockSpec (y.type).name));
+        }
+        for (auto& x : b)
+            for (auto& y : a)
+                if (x.type == y.type)
+                {
+                    if (x.bypassed != y.bypassed) bits.add (juce::String (blockSpec (x.type).name) + (x.bypassed ? " off" : " on"));
+                    section (blockSpec (x.type).name, blockSpec (x.type).params, y.params, x.params);
+                    break;
+                }
+    };
+    chain (before.pre, after.pre);
+    chain (before.post, after.post);
+    if (before.name != after.name) bits.add ("Renamed to " + after.name);
+    if (bits.isEmpty()) return "Saved";
+    juce::StringArray firstFew;
+    for (int i = 0; i < juce::jmin (2, bits.size()); ++i) firstFew.add (bits[i]);
+    return firstFew.joinIntoString (", ") + (bits.size() > 2 ? " (+" + juce::String (bits.size() - 2) + " more)" : juce::String());
+}
+
+/// Puts a change at the top of a rig's history, keeping it to `kRigHistory`.
+inline void noteChange (Rig& r, const juce::String& text)
+{
+    r.history.insert (r.history.begin(), { juce::Time::currentTimeMillis(), text });
+    if ((int) r.history.size() > kRigHistory) r.history.resize ((size_t) kRigHistory);
+}
+
+inline juce::var songToVar (const Song& s)
+{
+    using detail::set;
+    auto o = detail::obj();
+    set (o, "schema", 1);
+    set (o, "id", s.id);
+    set (o, "name", s.name);
+    set (o, "notes", s.notes);
+    set (o, "tempo", s.tempo);
+    set (o, "colour", (int) s.colour);
+    juce::Array<juce::var> ids;
+    for (auto& p : s.presetIds) ids.add (p);
+    set (o, "presets", ids);
+    auto ov = detail::obj();
+    for (auto& [k, rig] : s.overrides) ov.getDynamicObject()->setProperty (juce::String (k), rigToVar (rig));
+    set (o, "overrides", ov);
+    return o;
+}
+inline Song songFromVar (const juce::var& v)
+{
+    Song s;
+    s.id = v.getProperty ("id", {}).toString();
+    s.name = v.getProperty ("name", "New Song").toString();
+    s.notes = v.getProperty ("notes", {}).toString();
+    s.tempo = (double) v.getProperty ("tempo", 120.0);
+    s.colour = (juce::uint32) (int) v.getProperty ("colour", (int) 0xff2E7DF7);
+    if (auto* arr = v.getProperty ("presets", {}).getArray())
+        for (auto& e : *arr) s.presetIds.add (e.toString());
+    if (auto* ov = v.getProperty ("overrides", {}).getDynamicObject())
+        for (auto& p : ov->getProperties())
+            s.overrides[p.name.toString().getIntValue()] = rigFromVar (p.value);
+    return s;
+}
+
+/// Two rigs SOUND the same: everything but the name, id, order and history.
+inline bool sameSound (const Rig& a, const Rig& b)
+{
+    auto x = a, y = b;
+    for (auto* q : { &x, &y }) { q->id = {}; q->name = {}; q->order = 0; q->history.clear(); q->notes = {}; }
+    return juce::JSON::toString (rigToVar (x), true) == juce::JSON::toString (rigToVar (y), true);
+}
+
+inline juce::var setlistToVar (const Setlist& s)
+{
+    using detail::set;
+    auto o = detail::obj();
+    set (o, "schema", 1);
+    set (o, "id", s.id);
+    set (o, "name", s.name);
+    juce::Array<juce::var> ids;
+    for (auto& g : s.songIds) ids.add (g);
+    set (o, "songs", ids);
+    return o;
+}
+inline Setlist setlistFromVar (const juce::var& v)
+{
+    Setlist s;
+    s.id = v.getProperty ("id", {}).toString();
+    s.name = v.getProperty ("name", "New Set").toString();
+    if (auto* arr = v.getProperty ("songs", {}).getArray())
+        for (auto& e : *arr) s.songIds.add (e.toString());
+    return s;
+}
+
+//==============================================================================
+/// Default chains. A new rig is a working bass rig, not an empty board: gate,
+/// compressor, amp, 4x10. Everything else is added by the player.
+inline ChainState defaultPreChain()
+{
+    return { defaultBlockState (BlockType::noiseGate),
+             defaultBlockState (BlockType::optoComp),
+             defaultBlockState (BlockType::clearDrive, true) };
+}
+inline ChainState defaultPostChain()
+{
+    return { defaultBlockState (BlockType::roomVerb, true) };
+}
+inline Rig defaultRig (const juce::String& name = "Glass Clean")
+{
+    Rig r;
+    r.name = name;
+    r.pre = defaultPreChain();
+    r.post = defaultPostChain();
+    return r;
+}
+/// A rig with NOTHING on the board: amp, cab and the fixed input/output stages
+/// only. This is what "New preset" makes — a player building a sound wants to
+/// start from their bass and the amp, not from someone else's three pedals,
+/// and deleting what you did not ask for is the most tedious way to begin.
+inline Rig emptyRig (const juce::String& name = "New Rig")
+{
+    Rig r;
+    r.name = name;
+    return r;
+}
+
+//==============================================================================
+/// The on-disk library. Scans, loads and saves; nothing here touches audio.
+class RigLibrary
+{
+public:
+    void scan()
+    {
+        presets_.clear(); songs_.clear(); setlists_.clear(); irs_.clear();
+        for (auto& d : { presetsDir(), songsDir(), setlistsDir(), irDir(), loopsDir(), stageDir() })
+            d.createDirectory();
+
+        for (auto& f : presetsDir().findChildFiles (juce::File::findFiles, false, "*.rig.json"))
+        {
+            // A preset is a few kilobytes. Anything far larger is not one of
+            // ours (or is damaged) and is not read at all.
+            if (f.getSize() > kMaxPresetBytes) continue;
+            auto v = juce::JSON::parse (f);
+            if (! v.isObject()) continue;
+            juce::StringArray missing;
+            auto r = rigFromVar (v, &missing);
+            if (r.id.isEmpty()) r.id = f.getFileNameWithoutExtension().upToFirstOccurrenceOf (".", false, false);
+            if (! missing.isEmpty())
+                juce::Logger::writeToLog ("Top End: preset '" + r.name + "' references unknown blocks: " + missing.joinIntoString (", "));
+            presets_.push_back (std::move (r));
+        }
+        std::sort (presets_.begin(), presets_.end(), [] (const Rig& a, const Rig& b)
+        {
+            if (a.order != b.order) return a.order < b.order;
+            return a.name.compareIgnoreCase (b.name) < 0;
+        });
+        for (auto& f : songsDir().findChildFiles (juce::File::findFiles, false, "*.song.json"))
+            songs_.push_back (songFromVar (juce::JSON::parse (f)));
+        for (auto& f : setlistsDir().findChildFiles (juce::File::findFiles, false, "*.set.json"))
+            setlists_.push_back (setlistFromVar (juce::JSON::parse (f)));
+        for (auto& f : irDir().findChildFiles (juce::File::findFiles, false, "*.wav"))
+            irs_.add (f.getFullPathName());
+        irs_.sort (true);
+    }
+
+    static constexpr juce::int64 kMaxPresetBytes = 1 << 20;
+    const std::vector<Rig>& presets() const { return presets_; }
+    const std::vector<Song>& songs() const { return songs_; }
+    const std::vector<Setlist>& setlists() const { return setlists_; }
+    const juce::StringArray& irs() const { return irs_; }
+
+    const Rig* findPreset (const juce::String& id) const
+    {
+        for (auto& r : presets_) if (r.id == id) return &r;
+        return nullptr;
+    }
+    const Song* findSong (const juce::String& id) const
+    {
+        for (auto& s : songs_) if (s.id == id) return &s;
+        return nullptr;
+    }
+
+    juce::String savePreset (Rig r)
+    {
+        if (r.id.isEmpty()) r.id = juce::Uuid().toDashedString();
+        presetsDir().createDirectory();
+        presetsDir().getChildFile (r.id + ".rig.json").replaceWithText (juce::JSON::toString (rigToVar (r), false));
+        for (auto& existing : presets_)
+            if (existing.id == r.id) { existing = r; return r.id; }
+        presets_.push_back (std::move (r));
+        return presets_.back().id;
+    }
+    juce::String saveSong (Song s)
+    {
+        if (s.id.isEmpty()) s.id = juce::Uuid().toDashedString();
+        songsDir().createDirectory();
+        songsDir().getChildFile (s.id + ".song.json").replaceWithText (juce::JSON::toString (songToVar (s), false));
+        for (auto& existing : songs_)
+            if (existing.id == s.id) { existing = s; return s.id; }
+        songs_.push_back (std::move (s));
+        return songs_.back().id;
+    }
+    juce::String saveSetlist (Setlist s)
+    {
+        if (s.id.isEmpty()) s.id = juce::Uuid().toDashedString();
+        setlistsDir().createDirectory();
+        setlistsDir().getChildFile (s.id + ".set.json").replaceWithText (juce::JSON::toString (setlistToVar (s), false));
+        for (auto& existing : setlists_)
+            if (existing.id == s.id) { existing = s; return s.id; }
+        setlists_.push_back (std::move (s));
+        return setlists_.back().id;
+    }
+    bool deletePreset (const juce::String& id)
+    {
+        const bool ok = presetsDir().getChildFile (id + ".rig.json").deleteFile();
+        presets_.erase (std::remove_if (presets_.begin(), presets_.end(),
+                                        [&id] (const Rig& r) { return r.id == id; }), presets_.end());
+        // A preset that songs referenced would leave holes in them. Drop the
+        // references too, so a song never lists a scene that cannot load.
+        for (auto& s : songs_)
+            if (s.presetIds.contains (id))
+            {
+                s.presetIds.removeString (id);
+                saveSong (s);
+            }
+        return ok;
+    }
+    bool deleteSong (const juce::String& id)
+    {
+        const bool ok = songsDir().getChildFile (id + ".song.json").deleteFile();
+        songs_.erase (std::remove_if (songs_.begin(), songs_.end(),
+                                      [&id] (const Song& s) { return s.id == id; }), songs_.end());
+        for (auto& set : setlists_)
+            if (set.songIds.contains (id))
+            {
+                set.songIds.removeString (id);
+                saveSetlist (set);
+            }
+        return ok;
+    }
+    bool deleteSetlist (const juce::String& id)
+    {
+        const bool ok = setlistsDir().getChildFile (id + ".set.json").deleteFile();
+        setlists_.erase (std::remove_if (setlists_.begin(), setlists_.end(),
+                                         [&id] (const Setlist& s) { return s.id == id; }), setlists_.end());
+        return ok;
+    }
+    /// Mutable access for the editor's song builder. Callers must `saveSong`.
+    Song* findSongMutable (const juce::String& id)
+    {
+        for (auto& s : songs_) if (s.id == id) return &s;
+        return nullptr;
+    }
+
+    /// Writes the factory library once, marked by a file so a player who deletes
+    /// a factory preset does not get it back on the next launch.
+    void generateFactoryIfNeeded()
+    {
+        auto marker = appDataDir().getChildFile ("factory-v1.txt");
+        if (marker.existsAsFile()) return;
+        appDataDir().createDirectory();
+        buildFactory();
+        marker.replaceWithText ("Top End factory content v1\n");
+    }
+
+private:
+    void buildFactory();
+
+    std::vector<Rig> presets_;
+    std::vector<Song> songs_;
+    std::vector<Setlist> setlists_;
+    juce::StringArray irs_;
+};
+
+//==============================================================================
+/// The twelve factory rigs. Each is written as a small set of path edits over
+/// the default rig, which is also the clearest documentation of how a rig is
+/// built — and it exercises `setPath` on every launch, so a broken path shows up
+/// immediately rather than in a user's preset a month later.
+inline void RigLibrary::buildFactory()
+{
+    struct Edit { const char* path; float value; };
+    struct Factory
+    {
+        const char* name;
+        juce::uint32 colour;
+        std::vector<BlockType> pre, post;
+        std::vector<Edit> edits;
+    };
+
+    // The six scenes of the Sunday set first (A-F on the footswitches), then
+    // the rest. Amp model indices: 0 Plexi 68, 1 Black Panel, 2 Tweed 57,
+    // 3 Top Boost 30, 4 Modern Hi-Gain, 5 Solid Clean. Channel 0/1/2 =
+    // Clean/Crunch/Lead. Cab 0 1x12 open, 1 2x12, 2 4x12.
+    const std::vector<Factory> factory {
+        { "Call to Worship", 0xff7FA88A,
+          { BlockType::noiseGate, BlockType::optoComp },
+          { BlockType::chorus, BlockType::ambientVerb },
+          { { "amp.model", 1 }, { "amp.channel", 0 }, { "amp.gain", 45 }, { "amp.bright", 1 },
+            { "cab.model", 1 }, { "post.0.mix", 25 }, { "post.1.mix", 30 } } },
+
+        { "Glass Clean", 0xffD8A64A,
+          { BlockType::noiseGate, BlockType::optoComp, BlockType::clearDrive },
+          { BlockType::digitalDelay, BlockType::ambientVerb },
+          { { "amp.model", 0 }, { "amp.channel", 1 }, { "amp.gain", 40 }, { "amp.mid", 62 },
+            { "cab.model", 1 }, { "pre.2.drive", 30 }, { "post.0.syncDivisionL", 4 }, { "post.0.mix", 22 } } },
+
+        { "Bridge Drive", 0xff9C4A3F,
+          { BlockType::noiseGate, BlockType::tubeOd },
+          { BlockType::roomVerb },
+          { { "amp.model", 0 }, { "amp.channel", 1 }, { "amp.gain", 62 }, { "amp.presence", 55 },
+            { "cab.model", 2 }, { "pre.1.drive", 45 } } },
+
+        { "Swell Pad", 0xff5F86A6,
+          { BlockType::noiseGate, BlockType::optoComp },
+          { BlockType::analogDelay, BlockType::ambientVerb },
+          { { "amp.model", 5 }, { "amp.channel", 0 }, { "amp.gain", 40 }, { "cab.model", 1 },
+            { "post.0.feedback", 45 }, { "post.0.mix", 30 }, { "post.1.decay", 9 }, { "post.1.shimmer", 35 },
+            { "post.1.mix", 45 } } },
+
+        { "Lead Dotted 8th", 0xff4F8F8A,
+          { BlockType::noiseGate, BlockType::boost, BlockType::tubeOd },
+          { BlockType::digitalDelay, BlockType::roomVerb },
+          { { "amp.model", 3 }, { "amp.channel", 2 }, { "amp.gain", 55 }, { "cab.model", 1 },
+            { "pre.2.drive", 50 }, { "post.0.syncDivisionL", 4 }, { "post.0.syncDivisionR", 4 },
+            { "post.0.feedback", 38 }, { "post.0.mix", 26 } } },
+
+        { "Altar Call", 0xffD9CFBD,
+          { BlockType::noiseGate, BlockType::optoComp },
+          { BlockType::tremolo, BlockType::ambientVerb },
+          { { "amp.model", 2 }, { "amp.channel", 0 }, { "amp.gain", 38 }, { "cab.model", 0 },
+            { "post.0.rate", 3.2f }, { "post.0.depth", 35 }, { "post.1.mix", 32 } } },
+
+        { "Fuzz Wall", 0xffB04A3A,
+          { BlockType::noiseGate, BlockType::fuzz },
+          { BlockType::roomVerb },
+          { { "amp.model", 0 }, { "amp.channel", 1 }, { "amp.gain", 50 }, { "cab.model", 2 },
+            { "pre.1.fuzz", 72 } } },
+
+        { "Modern Rhythm", 0xff3B3D40,
+          { BlockType::noiseGate, BlockType::boost },
+          {},
+          { { "amp.model", 4 }, { "amp.channel", 2 }, { "amp.gain", 58 }, { "amp.tight", 1 },
+            { "amp.mid", 48 }, { "cab.model", 2 }, { "pre.0.threshold", -55 } } },
+
+        { "Funky Wah", 0xffB2D235,
+          { BlockType::noiseGate, BlockType::fetComp, BlockType::envFilter },
+          {},
+          { { "amp.model", 1 }, { "amp.channel", 0 }, { "amp.gain", 42 }, { "amp.bright", 1 },
+            { "cab.model", 0 }, { "pre.2.sens", 60 } } },
+
+        { "Practice Clean", 0xff8AA6CF,
+          { BlockType::noiseGate },
+          {},
+          { { "amp.model", 1 }, { "amp.channel", 0 }, { "amp.gain", 35 }, { "cab.model", 0 } } },
+    };
+
+    juce::StringArray madeIds;
+    int order = 0;
+    for (auto& f : factory)
+    {
+        Rig r = defaultRig (f.name);
+        r.colour = f.colour;
+        r.order = order++;          // keep the list in the order it reads here
+        r.pre.clear();
+        for (auto t : f.pre) r.pre.push_back (defaultBlockState (t));
+        r.post.clear();
+        for (auto t : f.post) r.post.push_back (defaultBlockState (t));
+        for (auto& e : f.edits)
+            if (! setPath (r, e.path, e.value))
+                juce::Logger::writeToLog (juce::String ("Top End factory: unknown path ") + e.path
+                                          + " in preset " + f.name);
+        madeIds.add (savePreset (std::move (r)));
+    }
+
+    // Two demo sets and one setlist holding them. The Sunday set is the six
+    // scenes the footswitches A-F step through.
+    struct Demo { const char* name; double tempo; std::vector<int> presets; };
+    const std::vector<Demo> demos {
+        { "Sunday Set", 96.0, { 0, 1, 2, 3, 4, 5 } },
+        { "Rock Night", 128.0, { 2, 6, 7, 4 } } };
+
+    juce::StringArray songIds;
+    for (auto& d : demos)
+    {
+        Song s;
+        s.name = d.name;
+        s.tempo = d.tempo;
+        for (int i : d.presets)
+            if (i >= 0 && i < madeIds.size()) s.presetIds.add (madeIds[i]);
+        songIds.add (saveSong (std::move (s)));
+    }
+    Setlist set;
+    set.name = "Demo Set";
+    set.songIds = songIds;
+    saveSetlist (std::move (set));
+}
+
+} // namespace topend
