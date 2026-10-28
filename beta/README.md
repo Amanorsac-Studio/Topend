@@ -31,6 +31,12 @@ time. Close other music software before opening Top End. In **Settings › Audio
   STOP, then PLAY, and check it comes back in on the "1".
 - Learn: import a song, separate it, play along.
 - Cover: record yourself over a song and export it.
+- New in Beta Test 3: drag pedals around the board and turn their knobs on it; browse the
+  100+ factory presets in the Library; make a preset pack and send it to a friend.
+- The Bow pedal (Strings presets): play slowly and let notes ring. Tell us if it sounds like a
+  violin, and try Solo mode on a single melody line.
+- The Your Amp pedal: if you have a Neural Amp Modeler capture (.nam) of an amp, drop it on
+  Top End and play through it.
 
 ## Report a problem
 
@@ -40,14 +46,18 @@ to hello@amanorsac.studio.
 
 ## Send us your presets
 
-In Top End, open **Library › Share presets**, choose the presets and add your name
-if you want it credited. They are copied to:
+In Top End, open **Library › Make a pack**, choose the presets, and give the pack
+a name and your name as its author. Top End saves it as one `.tepack` file in:
 
-- Windows: `Documents\Amanorsac Studio\Top End\Beta Presets\`
-- macOS: `~/Documents/Amanorsac Studio/Top End/Beta Presets/`
+- Windows: `Documents\Amanorsac Studio\Top End\Packs\`
+- macOS: `~/Documents/Amanorsac Studio/Top End/Packs/`
 
-Attach the files to a **Preset submission** issue, or email them to
+Attach the file to a **Preset submission** issue, or email it to
 hello@amanorsac.studio. Nothing is sent from Top End for you.
+
+A pack is also how you share sounds with other players: they drop the `.tepack`
+file on Top End (or use **Library › Packs › Install a pack**). Every pack is
+checked before anything is added, and it holds sounds only.
 
 ## What Top End keeps on your computer
 

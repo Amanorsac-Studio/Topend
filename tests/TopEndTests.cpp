@@ -777,7 +777,7 @@ void testSynth()
 void testFactoryContent()
 {
     section ("Factory content");
-    // Every factory edit must resolve — buildFactory() logs a warning otherwise,
+    // Every factory edit must resolve — makeFactoryRig() logs a warning otherwise,
     // and a silently-ignored path is exactly the bug this catches.
     auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory)
                   .getChildFile ("TopEndTest-" + juce::Uuid().toDashedString());
@@ -787,7 +787,7 @@ void testFactoryContent()
     RigLibrary lib;
     lib.generateFactoryIfNeeded();
     lib.scan();
-    check (lib.presets().size() == 10, "ten factory presets were written ("
+    check (lib.presets().size() == factoryPresets().size() && lib.presets().size() >= 100, "the whole factory library was written ("
            + juce::String ((int) lib.presets().size()) + ")");
     check (lib.songs().size() == 2, "two demo sets");
     check (lib.setlists().size() == 1, "one demo setlist");

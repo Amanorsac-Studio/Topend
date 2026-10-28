@@ -73,13 +73,15 @@ inline juce::File factoryDir()
    #elif JUCE_MAC
     return juce::File ("/Library/Application Support/Amanorsac Studio/Top End");
    #else
-    return juce::File ("/usr/share/amanorsac-studio/low-end");
+    return juce::File ("/usr/share/amanorsac-studio/top-end");
    #endif
 }
 inline juce::File presetsDir()  { return appDataDir().getChildFile ("Presets"); }
 inline juce::File songsDir()    { return appDataDir().getChildFile ("Songs"); }
 inline juce::File setlistsDir() { return appDataDir().getChildFile ("Setlists"); }
 inline juce::File irDir()       { return appDataDir().getChildFile ("IRs"); }
+/// Neural Amp Modeler captures (.nam) for the Your Amp pedal.
+inline juce::File namDir()      { return appDataDir().getChildFile ("Amp Captures"); }
 inline juce::File loopsDir()    { return appDataDir().getChildFile ("Loops"); }
 /// Presets the player exports, one file each, to keep or to give to someone.
 inline juce::File exportsDir()  { return appDataDir().getChildFile ("Exports"); }
@@ -100,6 +102,12 @@ struct Rig
     /// writes its declaration order here; a preset the user saves gets the
     /// default and sorts after them, by name.
     int order = 1000;
+    /// What kind of sound it is (Worship, Rock, ...), for the Library's filters.
+    juce::String category;
+    /// Where it came from: a factory preset's permanent key (so an update can
+    /// add new factory presets without bringing back ones the player deleted),
+    /// and the pack it was installed from. Empty for the player's own presets.
+    juce::String factoryKey, packId, packName, packAuthor;
 
     ParamValues in { defaultsFor (inputParams()) };
     ParamValues amp { defaultsFor (ampParams()) };
@@ -401,6 +409,9 @@ inline juce::var rigToVar (const Rig& r)
     set (o, "notes", r.notes);
     set (o, "colour", (int) r.colour);
     set (o, "order", r.order);
+    if (r.category.isNotEmpty())   set (o, "category", r.category);
+    if (r.factoryKey.isNotEmpty()) set (o, "factoryKey", r.factoryKey);
+    if (r.packId.isNotEmpty())   { set (o, "packId", r.packId); set (o, "packName", r.packName); set (o, "packAuthor", r.packAuthor); }
     set (o, "in", detail::valuesToVar (r.in));
     set (o, "amp", detail::valuesToVar (r.amp));
     set (o, "cab", detail::valuesToVar (r.cab));
@@ -430,6 +441,11 @@ inline Rig rigFromVar (const juce::var& v, juce::StringArray* unresolved = nullp
     r.notes = v.getProperty ("notes", {}).toString();
     r.colour = (juce::uint32) (int) v.getProperty ("colour", (int) 0xff2E7DF7);
     r.order = (int) v.getProperty ("order", 1000);
+    r.category = v.getProperty ("category", {}).toString();
+    r.factoryKey = v.getProperty ("factoryKey", {}).toString();
+    r.packId = v.getProperty ("packId", {}).toString();
+    r.packName = v.getProperty ("packName", {}).toString();
+    r.packAuthor = v.getProperty ("packAuthor", {}).toString();
     detail::valuesFromVar (v.getProperty ("in", {}), r.in);
     detail::valuesFromVar (v.getProperty ("amp", {}), r.amp);
     detail::valuesFromVar (v.getProperty ("cab", {}), r.cab);
@@ -611,8 +627,8 @@ class RigLibrary
 public:
     void scan()
     {
-        presets_.clear(); songs_.clear(); setlists_.clear(); irs_.clear();
-        for (auto& d : { presetsDir(), songsDir(), setlistsDir(), irDir(), loopsDir(), stageDir() })
+        presets_.clear(); songs_.clear(); setlists_.clear(); irs_.clear(); captures_.clear();
+        for (auto& d : { presetsDir(), songsDir(), setlistsDir(), irDir(), namDir(), loopsDir(), stageDir() })
             d.createDirectory();
 
         for (auto& f : presetsDir().findChildFiles (juce::File::findFiles, false, "*.rig.json"))
@@ -641,6 +657,9 @@ public:
         for (auto& f : irDir().findChildFiles (juce::File::findFiles, false, "*.wav"))
             irs_.add (f.getFullPathName());
         irs_.sort (true);
+        for (auto& f : namDir().findChildFiles (juce::File::findFiles, false, "*.nam"))
+            captures_.add (f.getFileName());
+        captures_.sort (true);
     }
 
     static constexpr juce::int64 kMaxPresetBytes = 1 << 20;
@@ -648,6 +667,8 @@ public:
     const std::vector<Song>& songs() const { return songs_; }
     const std::vector<Setlist>& setlists() const { return setlists_; }
     const juce::StringArray& irs() const { return irs_; }
+    /// File names of the amp captures (.nam) in namDir().
+    const juce::StringArray& captures() const { return captures_; }
 
     const Rig* findPreset (const juce::String& id) const
     {
@@ -732,148 +753,19 @@ public:
         return nullptr;
     }
 
-    /// Writes the factory library once, marked by a file so a player who deletes
-    /// a factory preset does not get it back on the next launch.
-    void generateFactoryIfNeeded()
-    {
-        auto marker = appDataDir().getChildFile ("factory-v1.txt");
-        if (marker.existsAsFile()) return;
-        appDataDir().createDirectory();
-        buildFactory();
-        marker.replaceWithText ("Top End factory content v1\n");
-    }
+    /// Adds any factory preset this machine has not had before (see
+    /// FactoryPresets.h): a deleted one stays deleted, a new one arrives.
+    void generateFactoryIfNeeded() { syncFactory(); }
 
 private:
-    void buildFactory();
+    void syncFactory();   // FactoryPresets.h
 
     std::vector<Rig> presets_;
     std::vector<Song> songs_;
     std::vector<Setlist> setlists_;
-    juce::StringArray irs_;
+    juce::StringArray irs_, captures_;
 };
 
-//==============================================================================
-/// The twelve factory rigs. Each is written as a small set of path edits over
-/// the default rig, which is also the clearest documentation of how a rig is
-/// built — and it exercises `setPath` on every launch, so a broken path shows up
-/// immediately rather than in a user's preset a month later.
-inline void RigLibrary::buildFactory()
-{
-    struct Edit { const char* path; float value; };
-    struct Factory
-    {
-        const char* name;
-        juce::uint32 colour;
-        std::vector<BlockType> pre, post;
-        std::vector<Edit> edits;
-    };
-
-    // The six scenes of the Sunday set first (A-F on the footswitches), then
-    // the rest. Amp model indices: 0 Plexi 68, 1 Black Panel, 2 Tweed 57,
-    // 3 Top Boost 30, 4 Modern Hi-Gain, 5 Solid Clean. Channel 0/1/2 =
-    // Clean/Crunch/Lead. Cab 0 1x12 open, 1 2x12, 2 4x12.
-    const std::vector<Factory> factory {
-        { "Call to Worship", 0xff7FA88A,
-          { BlockType::noiseGate, BlockType::optoComp },
-          { BlockType::chorus, BlockType::ambientVerb },
-          { { "amp.model", 1 }, { "amp.channel", 0 }, { "amp.gain", 45 }, { "amp.bright", 1 },
-            { "cab.model", 1 }, { "post.0.mix", 25 }, { "post.1.mix", 30 } } },
-
-        { "Glass Clean", 0xffD8A64A,
-          { BlockType::noiseGate, BlockType::optoComp, BlockType::clearDrive },
-          { BlockType::digitalDelay, BlockType::ambientVerb },
-          { { "amp.model", 0 }, { "amp.channel", 1 }, { "amp.gain", 40 }, { "amp.mid", 62 },
-            { "cab.model", 1 }, { "pre.2.drive", 30 }, { "post.0.syncDivisionL", 4 }, { "post.0.mix", 22 } } },
-
-        { "Bridge Drive", 0xff9C4A3F,
-          { BlockType::noiseGate, BlockType::tubeOd },
-          { BlockType::roomVerb },
-          { { "amp.model", 0 }, { "amp.channel", 1 }, { "amp.gain", 62 }, { "amp.presence", 55 },
-            { "cab.model", 2 }, { "pre.1.drive", 45 } } },
-
-        { "Swell Pad", 0xff5F86A6,
-          { BlockType::noiseGate, BlockType::optoComp },
-          { BlockType::analogDelay, BlockType::ambientVerb },
-          { { "amp.model", 5 }, { "amp.channel", 0 }, { "amp.gain", 40 }, { "cab.model", 1 },
-            { "post.0.feedback", 45 }, { "post.0.mix", 30 }, { "post.1.decay", 9 }, { "post.1.shimmer", 35 },
-            { "post.1.mix", 45 } } },
-
-        { "Lead Dotted 8th", 0xff4F8F8A,
-          { BlockType::noiseGate, BlockType::boost, BlockType::tubeOd },
-          { BlockType::digitalDelay, BlockType::roomVerb },
-          { { "amp.model", 3 }, { "amp.channel", 2 }, { "amp.gain", 55 }, { "cab.model", 1 },
-            { "pre.2.drive", 50 }, { "post.0.syncDivisionL", 4 }, { "post.0.syncDivisionR", 4 },
-            { "post.0.feedback", 38 }, { "post.0.mix", 26 } } },
-
-        { "Altar Call", 0xffD9CFBD,
-          { BlockType::noiseGate, BlockType::optoComp },
-          { BlockType::tremolo, BlockType::ambientVerb },
-          { { "amp.model", 2 }, { "amp.channel", 0 }, { "amp.gain", 38 }, { "cab.model", 0 },
-            { "post.0.rate", 3.2f }, { "post.0.depth", 35 }, { "post.1.mix", 32 } } },
-
-        { "Fuzz Wall", 0xffB04A3A,
-          { BlockType::noiseGate, BlockType::fuzz },
-          { BlockType::roomVerb },
-          { { "amp.model", 0 }, { "amp.channel", 1 }, { "amp.gain", 50 }, { "cab.model", 2 },
-            { "pre.1.fuzz", 72 } } },
-
-        { "Modern Rhythm", 0xff3B3D40,
-          { BlockType::noiseGate, BlockType::boost },
-          {},
-          { { "amp.model", 4 }, { "amp.channel", 2 }, { "amp.gain", 58 }, { "amp.tight", 1 },
-            { "amp.mid", 48 }, { "cab.model", 2 }, { "pre.0.threshold", -55 } } },
-
-        { "Funky Wah", 0xffB2D235,
-          { BlockType::noiseGate, BlockType::fetComp, BlockType::envFilter },
-          {},
-          { { "amp.model", 1 }, { "amp.channel", 0 }, { "amp.gain", 42 }, { "amp.bright", 1 },
-            { "cab.model", 0 }, { "pre.2.sens", 60 } } },
-
-        { "Practice Clean", 0xff8AA6CF,
-          { BlockType::noiseGate },
-          {},
-          { { "amp.model", 1 }, { "amp.channel", 0 }, { "amp.gain", 35 }, { "cab.model", 0 } } },
-    };
-
-    juce::StringArray madeIds;
-    int order = 0;
-    for (auto& f : factory)
-    {
-        Rig r = defaultRig (f.name);
-        r.colour = f.colour;
-        r.order = order++;          // keep the list in the order it reads here
-        r.pre.clear();
-        for (auto t : f.pre) r.pre.push_back (defaultBlockState (t));
-        r.post.clear();
-        for (auto t : f.post) r.post.push_back (defaultBlockState (t));
-        for (auto& e : f.edits)
-            if (! setPath (r, e.path, e.value))
-                juce::Logger::writeToLog (juce::String ("Top End factory: unknown path ") + e.path
-                                          + " in preset " + f.name);
-        madeIds.add (savePreset (std::move (r)));
-    }
-
-    // Two demo sets and one setlist holding them. The Sunday set is the six
-    // scenes the footswitches A-F step through.
-    struct Demo { const char* name; double tempo; std::vector<int> presets; };
-    const std::vector<Demo> demos {
-        { "Sunday Set", 96.0, { 0, 1, 2, 3, 4, 5 } },
-        { "Rock Night", 128.0, { 2, 6, 7, 4 } } };
-
-    juce::StringArray songIds;
-    for (auto& d : demos)
-    {
-        Song s;
-        s.name = d.name;
-        s.tempo = d.tempo;
-        for (int i : d.presets)
-            if (i >= 0 && i < madeIds.size()) s.presetIds.add (madeIds[i]);
-        songIds.add (saveSong (std::move (s)));
-    }
-    Setlist set;
-    set.name = "Demo Set";
-    set.songIds = songIds;
-    saveSetlist (std::move (set));
-}
-
 } // namespace topend
+
+#include "FactoryPresets.h"

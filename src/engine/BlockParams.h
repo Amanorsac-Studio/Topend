@@ -42,6 +42,10 @@ enum class BlockType : int
     analogDelay, digitalDelay, roomVerb, ambientVerb,
     // added for guitar (kept at the end so the earlier indices never move)
     wah,
+    // guitar into bowed strings (October 2026)
+    bow,
+    // a player's own amp, from a Neural Amp Modeler capture (October 2026)
+    nam,
     Count
 };
 constexpr int kNumBlockTypes = (int) BlockType::Count;
@@ -166,6 +170,32 @@ inline const std::vector<BlockSpec>& blockRegistry()
                 { "range", "Range", ParamKind::Enum, 0, 1, 0, { "Vintage", "Wide" } },
                 { "q", "Q", ParamKind::Float, 0, 100, 60 },
                 { "mix", "Mix", ParamKind::Float, 0, 100, 100 } } },
+
+            //------------------------------------------------------------ strings
+            // Bow: a guitar played as a bowed string. Every new note swells in
+            // (the pick disappears), is held up, gets a player's delayed vibrato
+            // and the body of a violin, viola or cello. Works on chords too.
+            { BlockType::bow, "bow", "Bow", "Filter", {}, {
+                { "swell", "Swell", ParamKind::Float, 0, 100, 55 },
+                { "vibrato", "Vibrato", ParamKind::Float, 0, 100, 35 },
+                { "body", "Body", ParamKind::Float, 0, 100, 60 },
+                { "rosin", "Rosin", ParamKind::Float, 0, 100, 20 },
+                { "voice", "Voice", ParamKind::Enum, 0, 2, 0, { "Violin", "Viola", "Cello" } },
+                { "level", "Level", ParamKind::Float, 0, 100, 50 },
+                // Section bows what you play (chords become a section); Solo follows
+                // the pitch of a single line and plays it on a bowed string.
+                { "mode", "Mode", ParamKind::Enum, 0, 1, 0, { "Section", "Solo" } } } },
+
+            //---------------------------------------------------------------- amp
+            // Your Amp: a Neural Amp Modeler capture of a real amp (the player's own
+            // .nam files). `capture` keeps which file as NamModel::keyFor(file name).
+            // `amp`/`cab`: whether the rig's own amp and cab still run after it.
+            { BlockType::nam, "nam", "Your Amp", "Amp", {}, {
+                { "capture", "Capture", ParamKind::Float, 0, 16777215, 0 },
+                { "input", "Input", ParamKind::Float, -24, 24, 0, {}, "dB" },
+                { "output", "Output", ParamKind::Float, -24, 24, 0, {}, "dB" },
+                { "amp", "Built-in Amp", ParamKind::Enum, 0, 1, 0, { "Off", "On" } },
+                { "cab", "Cab", ParamKind::Enum, 0, 1, 1, { "Off", "On" } } } },
         };
 
         for (auto& b : r)

@@ -1,5 +1,29 @@
 # Top End — what changed
 
+## 1.0.0 (beta), Beta Test 3
+
+**A real pedalboard**
+- Pedals look like pedals: our own enclosures in powder coat, hammertone, brushed metal, sparkle and wood, with knobs you turn on the board itself.
+- Drag a pedal to move it, across the amp too, or onto the bin to remove it. A full board goes onto two tiers.
+- A pedal browser opens over the amp: drag a pedal from it onto the board.
+
+**Presets**
+- 126 factory presets in 13 styles: Worship, Clean, Crunch, Rock, Blues, Metal, Funk, Country, Jazz, Ambient, Lead, Strings and Pop. An update adds new ones without bringing back any you deleted.
+- Make presets in the Library: the rig moves in, so you can build a sound without leaving the page.
+- Preset packs: Library › Make a pack saves presets as one .tepack file to share. Drop a pack on the app to install it; every pack is checked first and holds sounds only.
+- Tap a preset in the preset list to see its pedals before you load it.
+
+**Strings**
+- The Bow pedal turns the guitar into a bowed string: notes swell in, hold, and take a player's vibrato. Violin, viola or cello.
+- Section mode turns chords into a string section; Solo mode follows a single line and plays it on the string.
+
+**Your Amp**
+- The Your Amp pedal plays your own Neural Amp Modeler captures (.nam). Drop a .nam file on the app to add it. Each capture is checked, and timed on your computer, before it is used. It switches the built-in amp off, and the cab too if you want.
+
+**Fixes**
+- The Library no longer shakes while it is open.
+- The cab's name plate stays visible on small windows.
+
 ## 1.0.0 (beta)
 
 The first version, for testing.
@@ -15,7 +39,7 @@ The first version, for testing.
 **Presets and sets**
 - Presets, and sets that step through them on stage, with footswitches A to F for the scenes. Changing preset never cuts the sound.
 - An edit is kept when you change preset, and kept if Top End closes. When you close it, Top End asks whether to save each edit to the preset or to the set only, or to discard it.
-- Library › Share presets copies the presets you choose into a folder, ready to send back to us.
+- Library › Make a pack saves the presets you choose as one .tepack file, to send back to us or share with other players.
 
 **Looper and click**
 - A four-layer looper with overdub and undo.

@@ -114,6 +114,43 @@ else()
     set(TOPEND_ORT_RUNTIME "${onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so.${TOPEND_ORT_VERSION}")
 endif()
 
+# ------------------------------------------------------------------ Your Amp (NAM)
+# Neural Amp Modeler's core (MIT) plays a player's own .nam amp captures. It and
+# its dependencies, Eigen (MPL-2.0, held to its MPL-only code) and nlohmann/json
+# (MIT, shipped inside the NAM tree), are pinned by hash and built into one static
+# library. Only src/engine/nam/NamBridge.cpp includes their headers.
+FetchContent_Declare(nam_core
+    URL      "https://github.com/sdatkinson/NeuralAmpModelerCore/archive/0b3d3c97b0859a3a8c92a8628c4dd89a25eb5842.tar.gz"
+    URL_HASH SHA256=ca8bd36a66c0861c4359660440210455f436b48ba28529c7134a09a08eaaf616
+    SOURCE_SUBDIR "no-cmake")
+FetchContent_Declare(nam_eigen
+    URL      "https://gitlab.com/libeigen/eigen/-/archive/bc3b39870ecb690a623a3f49149a358b95c5781d/eigen-bc3b39870ecb690a623a3f49149a358b95c5781d.tar.gz"
+    URL_HASH SHA256=5f6557d1aca6e959a4b955c55f2935261fd30de59c0c79e35bc6d5cbe1de22d1
+    SOURCE_SUBDIR "no-cmake")
+# Sources only: SOURCE_SUBDIR names a folder with no CMakeLists.txt, so neither
+# project's own build (tools, tests) is run.
+FetchContent_MakeAvailable(nam_core nam_eigen)
+file(GLOB TOPEND_NAM_SOURCES CONFIGURE_DEPENDS
+    "${nam_core_SOURCE_DIR}/NAM/*.cpp"
+    "${nam_core_SOURCE_DIR}/NAM/*/*.cpp")
+# OBJECT, not STATIC: NAM's architectures register themselves from static
+# initialisers, which a static library would drop at link time.
+add_library(topend_nam OBJECT ${TOPEND_NAM_SOURCES} src/engine/nam/NamBridge.cpp)
+target_include_directories(topend_nam PRIVATE
+    "${nam_core_SOURCE_DIR}"
+    "${nam_core_SOURCE_DIR}/NAM"
+    "${nam_core_SOURCE_DIR}/Dependencies/nlohmann")
+target_include_directories(topend_nam SYSTEM PRIVATE "${nam_eigen_SOURCE_DIR}")
+target_compile_definitions(topend_nam PRIVATE NAM_SAMPLE_FLOAT EIGEN_MPL2_ONLY NAM_ENABLE_A2_FAST
+    $<$<PLATFORM_ID:Windows>:NOMINMAX WIN32_LEAN_AND_MEAN>)
+target_compile_features(topend_nam PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_options(topend_nam PRIVATE /bigobj /W0 $<$<CONFIG:Release>:/O2>)
+else()
+    target_compile_options(topend_nam PRIVATE -w $<$<CONFIG:Release>:-O3>)
+endif()
+set_target_properties(topend_nam PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Every target that separates needs the runtime library with it, and needs to
 # find THAT copy rather than any other:
 #
@@ -205,7 +242,7 @@ juce_add_plugin(TopEnd
     HARDENED_RUNTIME_ENABLED  TRUE
     HARDENED_RUNTIME_OPTIONS  "com.apple.security.device.audio-input"
     MICROPHONE_PERMISSION_ENABLED TRUE
-    MICROPHONE_PERMISSION_TEXT "Top End needs the audio input to hear your bass."
+    MICROPHONE_PERMISSION_TEXT "Top End needs the audio input to hear your guitar."
     FORMATS                   VST3 AU Standalone
     VST3_CATEGORIES           Fx Distortion)
 
@@ -236,6 +273,7 @@ endif()
 target_link_libraries(TopEnd PRIVATE
     TopEndUi
     topend_ort
+    topend_nam
     juce::juce_audio_utils
     juce::juce_cryptography
     juce::juce_dsp
@@ -254,6 +292,7 @@ target_compile_definitions(TopEndTests PRIVATE
     JUCE_USE_CURL=0
     JUCE_MODAL_LOOPS_PERMITTED=1)
 target_link_libraries(TopEndTests PRIVATE
+    topend_nam
     juce::juce_audio_formats
     juce::juce_cryptography
     juce::juce_dsp
@@ -278,6 +317,7 @@ target_compile_definitions(TopEndSoak PRIVATE
     TOPEND_HEADLESS=1)
 target_link_libraries(TopEndSoak PRIVATE
     topend_ort
+    topend_nam
     juce::juce_audio_utils
     juce::juce_cryptography
     juce::juce_dsp
@@ -302,6 +342,7 @@ target_compile_definitions(TopEndGateTest PRIVATE
     TOPEND_HEADLESS=1)
 target_link_libraries(TopEndGateTest PRIVATE
     topend_ort
+    topend_nam
     juce::juce_audio_utils
     juce::juce_cryptography
     juce::juce_dsp
@@ -324,6 +365,7 @@ target_compile_definitions(TopEndProcTest PRIVATE
     TOPEND_HEADLESS=1)
 target_link_libraries(TopEndProcTest PRIVATE
     topend_ort
+    topend_nam
     juce::juce_audio_utils
     juce::juce_cryptography
     juce::juce_dsp
@@ -341,6 +383,7 @@ target_include_directories(TopEndStems PRIVATE src)
 target_compile_definitions(TopEndStems PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
 target_link_libraries(TopEndStems PRIVATE
     topend_ort
+    topend_nam
     juce::juce_audio_formats
     juce::juce_dsp
     juce::juce_events
